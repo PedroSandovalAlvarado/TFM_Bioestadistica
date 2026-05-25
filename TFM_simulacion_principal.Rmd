@@ -1,0 +1,552 @@
+# Función para generar los datos sintéticos
+gen_od_pom <- function(
+  n = 500,
+  n_cont_norm = 5,
+  n_cont_skew = 2,
+  n_bin = 2,
+  n_fact = 2,
+  fact_levels = c(3, 4),
+  rho = 0.5,
+  n_latent = 0,
+  latent_strength = 0.0,
+  beta_sd = 0.5,
+  n_levels_y = 5,
+  thresholds = NULL,
+  nonlinear_frac = 0.0,
+  nonlinear_strength = 0.0,
+  include_interactions = FALSE,
+  interaction_types = c("xN:xN"),
+  interaction_frac = 0.1,
+  interaction_sd = 0.25,
+  fixed_interactions = NULL,
+  fit_with_interactions = TRUE,
+  seed = NULL
+) {
+  
+  # ==========================================================
+  # 0. Comprobaciones iniciales
+  # ==========================================================
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  if (!requireNamespace("MASS", quietly = TRUE)) {
+    stop("El paquete 'MASS' es necesario. Instálalo con install.packages('MASS').")
+  }
+  
+  if (n_levels_y < 3) {
+    stop("n_levels_y debe ser al menos 3 para una respuesta ordinal útil.")
+  }
+  
+  if (n_fact > 0 && length(fact_levels) < n_fact) {
+    stop("fact_levels debe tener al menos n_fact elementos.")
+  }
+  
+  if (latent_strength < 0 || latent_strength > 1) {
+    stop("latent_strength debe estar entre 0 y 1.")
+  }
+  
+  if (nonlinear_frac < 0 || nonlinear_frac > 1) {
+    stop("nonlinear_frac debe estar entre 0 y 1.")
+  }
+  
+  if (interaction_frac < 0 || interaction_frac > 1) {
+    stop("interaction_frac debe estar entre 0 y 1.")
+  }
+  
+  
+  # ==========================================================
+  # 1. Función auxiliar: matriz de correlación AR(1)
+  # ==========================================================
+  
+  make_ar1_cor <- function(p, rho) {
+    if (p <= 1) return(matrix(1, nrow = p, ncol = p))
+    outer(1:p, 1:p, function(i, j) rho^abs(i - j))
+  }
+  
+  
+  # ==========================================================
+  # 2. Generar variables continuas normales correlacionadas
+  # ==========================================================
+  
+  X_list <- list()
+  
+  if (n_cont_norm > 0) {
+    Sigma <- make_ar1_cor(n_cont_norm, rho)
+    
+    X_norm <- MASS::mvrnorm(
+      n = n,
+      mu = rep(0, n_cont_norm),
+      Sigma = Sigma
+    )
+    
+    X_norm <- scale(X_norm)
+    X_norm <- as.data.frame(X_norm)
+    names(X_norm) <- paste0("xN", seq_len(n_cont_norm))
+    
+    X_list[["norm"]] <- X_norm
+  }
+  
+  
+  # ==========================================================
+  # 3. Generar variables continuas sesgadas tipo lognormal
+  # ==========================================================
+  
+  if (n_cont_skew > 0) {
+    X_skew <- matrix(
+      rlnorm(n * n_cont_skew, meanlog = 0, sdlog = 0.7),
+      nrow = n,
+      ncol = n_cont_skew
+    )
+    
+    X_skew <- scale(X_skew)
+    X_skew <- as.data.frame(X_skew)
+    names(X_skew) <- paste0("xS", seq_len(n_cont_skew))
+    
+    X_list[["skew"]] <- X_skew
+  }
+  
+  
+  # ==========================================================
+  # 4. Generar variables binarias
+  # ==========================================================
+  
+  if (n_bin > 0) {
+    X_bin <- as.data.frame(
+      replicate(n_bin, rbinom(n, size = 1, prob = 0.5))
+    )
+    
+    names(X_bin) <- paste0("xB", seq_len(n_bin))
+    
+    for (j in seq_len(n_bin)) {
+      X_bin[[j]] <- factor(X_bin[[j]], levels = c(0, 1))
+    }
+    
+    X_list[["bin"]] <- X_bin
+  }
+  
+  
+  # ==========================================================
+  # 5. Generar factores nominales
+  # ==========================================================
+  
+  if (n_fact > 0) {
+    X_fact <- data.frame(row_id_tmp = seq_len(n))
+    
+    for (j in seq_len(n_fact)) {
+      lev_j <- fact_levels[j]
+      
+      X_fact[[paste0("xF", j)]] <- factor(
+        sample(seq_len(lev_j), size = n, replace = TRUE),
+        levels = seq_len(lev_j)
+      )
+    }
+    
+    X_fact$row_id_tmp <- NULL
+    
+    X_list[["fact"]] <- X_fact
+  }
+  
+  
+  # ==========================================================
+  # 6. Combinar predictores
+  # ==========================================================
+  
+  if (length(X_list) == 0) {
+    stop("Debe existir al menos un predictor.")
+  }
+  
+  X <- do.call(cbind, X_list)
+  
+  
+  # ==========================================================
+  # 7. Añadir estructura latente opcional
+  # ==========================================================
+  # La idea es introducir dependencia adicional entre predictores
+  # continuos mediante factores latentes comunes.
+  
+  cont_names <- names(X)[sapply(X, is.numeric)]
+  
+  if (n_latent > 0 && latent_strength > 0 && length(cont_names) > 0) {
+    
+    Z_lat <- matrix(
+      rnorm(n * n_latent),
+      nrow = n,
+      ncol = n_latent
+    )
+    
+    loadings <- matrix(
+      rnorm(length(cont_names) * n_latent),
+      nrow = length(cont_names),
+      ncol = n_latent
+    )
+    
+    latent_component <- Z_lat %*% t(loadings)
+    latent_component <- scale(latent_component)
+    
+    for (j in seq_along(cont_names)) {
+      x_old <- scale(X[[cont_names[j]]])
+      x_new <- sqrt(1 - latent_strength^2) * x_old +
+        latent_strength * latent_component[, j]
+      
+      X[[cont_names[j]]] <- as.numeric(scale(x_new))
+    }
+  }
+  
+  
+  # ==========================================================
+  # 8. Construir términos no lineales opcionales
+  # ==========================================================
+  # La no linealidad entra en el mecanismo generador de y,
+  # no necesariamente en el modelo ajustado.
+  
+  nonlinear_vars <- character(0)
+  nonlinear_terms <- NULL
+  gamma_nl <- NULL
+  
+  cont_names <- names(X)[sapply(X, is.numeric)]
+  
+  if (nonlinear_frac > 0 && nonlinear_strength > 0 && length(cont_names) > 0) {
+    
+    n_nl <- max(1, round(nonlinear_frac * length(cont_names)))
+    nonlinear_vars <- sample(cont_names, size = n_nl, replace = FALSE)
+    
+    nonlinear_terms <- sapply(nonlinear_vars, function(v) {
+      z <- as.numeric(scale(X[[v]]))
+      as.numeric(scale(z^2))
+    })
+    
+    if (is.null(dim(nonlinear_terms))) {
+      nonlinear_terms <- matrix(nonlinear_terms, ncol = 1)
+    }
+    
+    colnames(nonlinear_terms) <- paste0(nonlinear_vars, "_sq")
+    
+    gamma_nl <- rnorm(
+      n = ncol(nonlinear_terms),
+      mean = 0,
+      sd = nonlinear_strength
+    )
+  }
+  
+  
+  # ==========================================================
+  # 9. Construir fórmula base
+  # ==========================================================
+  
+  base_terms <- names(X)
+  formula_base <- as.formula(
+    paste("y_ord ~", paste(base_terms, collapse = " + "))
+  )
+  
+  
+  # ==========================================================
+  # 10. Crear posibles interacciones
+  # ==========================================================
+  
+  interaction_terms <- character(0)
+  interaction_beta <- NULL
+  
+  numeric_vars <- names(X)[sapply(X, is.numeric)]
+  bin_vars <- names(X)[sapply(X, function(z) is.factor(z) && nlevels(z) == 2)]
+  fact_vars <- names(X)[sapply(X, function(z) is.factor(z) && nlevels(z) > 2)]
+  
+  candidate_interactions <- character(0)
+  
+  if (include_interactions) {
+    
+    if ("xN:xN" %in% interaction_types && length(numeric_vars) >= 2) {
+      combs <- combn(numeric_vars, 2)
+      candidate_interactions <- c(
+        candidate_interactions,
+        apply(combs, 2, paste, collapse = ":")
+      )
+    }
+    
+    if ("xN:xB" %in% interaction_types &&
+        length(numeric_vars) >= 1 &&
+        length(bin_vars) >= 1) {
+      combs <- expand.grid(numeric_vars, bin_vars)
+      candidate_interactions <- c(
+        candidate_interactions,
+        paste(combs[, 1], combs[, 2], sep = ":")
+      )
+    }
+    
+    if ("xN:xF" %in% interaction_types &&
+        length(numeric_vars) >= 1 &&
+        length(fact_vars) >= 1) {
+      combs <- expand.grid(numeric_vars, fact_vars)
+      candidate_interactions <- c(
+        candidate_interactions,
+        paste(combs[, 1], combs[, 2], sep = ":")
+      )
+    }
+    
+    if (!is.null(fixed_interactions)) {
+      candidate_interactions <- unique(c(candidate_interactions, fixed_interactions))
+    }
+    
+    candidate_interactions <- unique(candidate_interactions)
+    
+    if (length(candidate_interactions) > 0) {
+      
+      if (!is.null(fixed_interactions)) {
+        fixed_ok <- fixed_interactions[
+          fixed_interactions %in% candidate_interactions
+        ]
+      } else {
+        fixed_ok <- character(0)
+      }
+      
+      remaining <- setdiff(candidate_interactions, fixed_ok)
+      
+      n_random_int <- max(
+        0,
+        round(interaction_frac * length(candidate_interactions)) - length(fixed_ok)
+      )
+      
+      random_int <- if (length(remaining) > 0 && n_random_int > 0) {
+        sample(
+          remaining,
+          size = min(n_random_int, length(remaining)),
+          replace = FALSE
+        )
+      } else {
+        character(0)
+      }
+      
+      interaction_terms <- unique(c(fixed_ok, random_int))
+    }
+  }
+  
+  
+  # ==========================================================
+  # 11. Fórmula para el modelo generador
+  # ==========================================================
+  
+  if (length(interaction_terms) > 0) {
+    formula_gen <- as.formula(
+      paste(
+        "y_ord ~",
+        paste(c(base_terms, interaction_terms), collapse = " + ")
+      )
+    )
+  } else {
+    formula_gen <- formula_base
+  }
+  
+  
+  # ==========================================================
+  # 12. Crear matriz de diseño para el predictor lineal
+  # ==========================================================
+  
+  X_for_mm <- X
+  X_for_mm$y_ord <- ordered(rep(1, n), levels = seq_len(n_levels_y))
+  
+  X_mm <- model.matrix(formula_gen, data = X_for_mm)
+  
+  # Quitamos intercepto.
+  X_no_intercept <- X_mm[, colnames(X_mm) != "(Intercept)", drop = FALSE]
+  
+  p <- ncol(X_no_intercept)
+  
+  beta_true <- rnorm(
+    n = p,
+    mean = 0,
+    sd = beta_sd
+  )
+  
+  names(beta_true) <- colnames(X_no_intercept)
+  
+  eta_linear <- as.vector(X_no_intercept %*% beta_true)
+  
+  
+  # ==========================================================
+  # 13. Añadir no linealidad al predictor lineal
+  # ==========================================================
+  
+  eta_nonlinear <- rep(0, n)
+  
+  if (!is.null(nonlinear_terms) && !is.null(gamma_nl)) {
+    eta_nonlinear <- as.vector(nonlinear_terms %*% gamma_nl)
+  }
+  
+  eta <- eta_linear + eta_nonlinear
+  
+  # Centramos eta para estabilizar la generación ordinal.
+  eta <- as.numeric(scale(eta, center = TRUE, scale = FALSE))
+  
+  
+  # ==========================================================
+  # 14. Definir puntos de corte ordinales
+  # ==========================================================
+  
+  if (is.null(thresholds)) {
+    # Umbrales simétricos razonables.
+    # Para 5 niveles: aprox. -1.5, -0.5, 0.5, 1.5
+    thresholds <- seq(
+      from = -1.5,
+      to = 1.5,
+      length.out = n_levels_y - 1
+    )
+  }
+  
+  if (length(thresholds) != n_levels_y - 1) {
+    stop("thresholds debe tener longitud n_levels_y - 1.")
+  }
+  
+  if (any(diff(thresholds) <= 0)) {
+    stop("Los thresholds deben estar estrictamente ordenados de menor a mayor.")
+  }
+  
+  
+  # ==========================================================
+  # 15. Calcular probabilidades acumuladas P(Y <= j)
+  # ==========================================================
+  # Modelo:
+  # logit[P(Y <= j)] = theta_j - eta
+  
+  cum_probs <- sapply(thresholds, function(th) {
+    plogis(th - eta)
+  })
+  
+  if (is.null(dim(cum_probs))) {
+    cum_probs <- matrix(cum_probs, ncol = 1)
+  }
+  
+  
+  # ==========================================================
+  # 16. Convertir probabilidades acumuladas en probabilidades
+  #     por categoría
+  # ==========================================================
+  
+  probs <- matrix(NA, nrow = n, ncol = n_levels_y)
+  
+  probs[, 1] <- cum_probs[, 1]
+  
+  if (n_levels_y > 2) {
+    for (j in 2:(n_levels_y - 1)) {
+      probs[, j] <- cum_probs[, j] - cum_probs[, j - 1]
+    }
+  }
+  
+  probs[, n_levels_y] <- 1 - cum_probs[, n_levels_y - 1]
+  
+  # Corrección numérica por seguridad.
+  probs[probs < 0] <- 0
+  probs <- probs / rowSums(probs)
+  
+  colnames(probs) <- paste0("P_Y", seq_len(n_levels_y))
+  
+  
+  # ==========================================================
+  # 17. Simular respuesta ordinal
+  # ==========================================================
+  
+  y_ord_num <- apply(probs, 1, function(pr) {
+    sample(seq_len(n_levels_y), size = 1, prob = pr)
+  })
+  
+  y_ord <- ordered(
+    y_ord_num,
+    levels = seq_len(n_levels_y)
+  )
+  
+  
+  # ==========================================================
+  # 18. Construir base final
+  # ==========================================================
+  
+  df <- X
+  df$y_ord <- y_ord
+  
+  # Ponemos la respuesta primero, como en tu estructura habitual.
+  df <- df[, c("y_ord", setdiff(names(df), "y_ord"))]
+  
+  
+  # ==========================================================
+  # 19. Ajustar modelo POM
+  # ==========================================================
+  
+  if (fit_with_interactions && length(interaction_terms) > 0) {
+    formula_fit <- formula_gen
+  } else {
+    formula_fit <- formula_base
+  }
+  
+  fit_pom <- tryCatch(
+    MASS::polr(
+      formula = formula_fit,
+      data = df,
+      method = "logistic",
+      Hess = TRUE
+    ),
+    error = function(e) {
+      warning("El modelo polr no pudo ajustarse: ", e$message)
+      return(NULL)
+    }
+  )
+  
+  
+  # ==========================================================
+  # 20. Resumen de la distribución ordinal
+  # ==========================================================
+  
+  y_distribution <- data.frame(
+    level = levels(df$y_ord),
+    n = as.vector(table(df$y_ord)),
+    prop = as.vector(prop.table(table(df$y_ord)))
+  )
+  
+  
+  # ==========================================================
+  # 21. Salida
+  # ==========================================================
+  
+  out <- list(
+    data = df,
+    fit_pom = fit_pom,
+    formula_gen = formula_gen,
+    formula_fit = formula_fit,
+    truth = list(
+      beta_true = beta_true,
+      thresholds = thresholds,
+      eta = eta,
+      eta_linear = eta_linear,
+      eta_nonlinear = eta_nonlinear,
+      nonlinear_vars = nonlinear_vars,
+      gamma_nonlinear = gamma_nl,
+      interaction_terms = interaction_terms,
+      n_levels_y = n_levels_y,
+      probs = probs,
+      y_distribution = y_distribution
+    ),
+    settings = list(
+      n = n,
+      n_cont_norm = n_cont_norm,
+      n_cont_skew = n_cont_skew,
+      n_bin = n_bin,
+      n_fact = n_fact,
+      fact_levels = fact_levels,
+      rho = rho,
+      n_latent = n_latent,
+      latent_strength = latent_strength,
+      beta_sd = beta_sd,
+      n_levels_y = n_levels_y,
+      thresholds = thresholds,
+      nonlinear_frac = nonlinear_frac,
+      nonlinear_strength = nonlinear_strength,
+      include_interactions = include_interactions,
+      interaction_types = interaction_types,
+      interaction_frac = interaction_frac,
+      interaction_sd = interaction_sd,
+      fixed_interactions = fixed_interactions,
+      fit_with_interactions = fit_with_interactions,
+      seed = seed
+    )
+  )
+  
+  class(out) <- "gen_od_pom"
+  
+  return(out)
+}
